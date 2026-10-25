@@ -7,16 +7,79 @@ $Dir      = Join-Path $env:APPDATA 'VocabSaver'
 $DataFile = Join-Path $Dir 'words.json'
 $CfgFile  = Join-Path $Dir 'settings.json'
 
+function Write-AtomicText($Path, $Content) {
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path $parent)) { New-Item -ItemType Directory $parent | Out-Null }
+    $temp = "$Path.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [IO.File]::WriteAllText($temp, $Content, (New-Object Text.UTF8Encoding $false))
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Replace($temp, $Path, "$Path.bak")
+        } else {
+            [IO.File]::Move($temp, $Path)
+        }
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
+function Restore-JsonBackup($Path, $Content) {
+    $temp = "$Path.$([Guid]::NewGuid().ToString('N')).restore"
+    try {
+        [IO.File]::WriteAllText($temp, $Content, (New-Object Text.UTF8Encoding $false))
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Replace($temp, $Path, $null)
+        } else {
+            [IO.File]::Move($temp, $Path)
+        }
+    } finally {
+        if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+    }
+}
+
+function Read-JsonFile($Path, $Label) {
+    $backup = "$Path.bak"
+    $candidates = @()
+    if ([IO.File]::Exists($Path)) { $candidates += $Path }
+    if ([IO.File]::Exists($backup)) { $candidates += $backup }
+    if (-not $candidates) { return [pscustomobject]@{ Data = @(); Recovered = $false; Source = $null } }
+
+    $readErrors = @()
+    foreach ($candidate in $candidates) {
+        try {
+            $json = [IO.File]::ReadAllText($candidate, [Text.Encoding]::UTF8)
+            $data = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+            $recovered = $candidate -ne $Path
+            if ($recovered) { Restore-JsonBackup $Path $json }
+            return [pscustomobject]@{
+                Data = $data; Recovered = $recovered; Source = $candidate
+            }
+        } catch {
+            $readErrors += "$candidate`: $($_.Exception.Message)"
+        }
+    }
+    throw "Không thể đọc $Label. File dữ liệu được giữ nguyên. $($readErrors -join ' | ')"
+}
+
 # Khoang thoi gian giua 2 bai tap (phut), luu lai giua cac lan mo app
 $QuizMinutes = 5
-if (Test-Path $CfgFile) {
-    try { $m = [int](Get-Content $CfgFile -Raw -Encoding UTF8 | ConvertFrom-Json).quizMinutes; if ($m -ge 1 -and $m -le 240) { $QuizMinutes = $m } } catch { }
+if ([IO.File]::Exists($CfgFile) -or [IO.File]::Exists("$CfgFile.bak")) {
+    try {
+        $settings = Read-JsonFile $CfgFile 'cài đặt'
+        $config = $settings.Data | Select-Object -First 1
+        $m = [int]$config.quizMinutes
+        if ($m -ge 1 -and $m -le 240) { $QuizMinutes = $m }
+        if ($settings.Recovered) {
+            [Windows.Forms.MessageBox]::Show("File cài đặt chính bị lỗi. Đã dùng bản sao lưu:`r`n$($settings.Source)", 'Vocab Saver') | Out-Null
+        }
+    } catch {
+        [Windows.Forms.MessageBox]::Show("$($_.Exception.Message)`r`nDùng thời gian ôn tập mặc định: $QuizMinutes phút.", 'Vocab Saver') | Out-Null
+    }
 }
 function Save-Settings {
-    if (-not (Test-Path $Dir)) { New-Item -ItemType Directory $Dir | Out-Null }
-    [IO.File]::WriteAllText($CfgFile, (@{ quizMinutes = $script:QuizMinutes } | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+    Write-AtomicText $CfgFile (@{ quizMinutes = $script:QuizMinutes } | ConvertTo-Json)
 }
-$WordRe   = "^[A-Za-z][A-Za-z'’-]*( [A-Za-z][A-Za-z'’-]*){0,3}$"   # 1-4 tu tieng Anh
+$script:WordRe = "^[A-Za-z][A-Za-z'’-]*( [A-Za-z][A-Za-z'’-]*){0,3}$"   # 1-4 tu tieng Anh
 
 # Moi loi deu ghi ra file log + hien hop thoai (vi app chay an)
 $LogFile = Join-Path $env:TEMP 'VocabSaver_error.log'
@@ -39,7 +102,17 @@ $script:HasNative = $false
 try {
     Add-Type -TypeDefinition @'
 using System;
+using System.Net;
 using System.Runtime.InteropServices;
+public sealed class VocabSaverWebClient : WebClient {
+    protected override WebRequest GetWebRequest(Uri address) {
+        var request = base.GetWebRequest(address);
+        request.Timeout = 10000;
+        var httpRequest = request as HttpWebRequest;
+        if (httpRequest != null) httpRequest.ReadWriteTimeout = 10000;
+        return request;
+    }
+}
 public static class VsNative {
     [DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr h, int attr, ref int val, int size);
     [DllImport("user32.dll")] public static extern bool ReleaseCapture();
@@ -52,22 +125,30 @@ public static class VsNative {
 
 # ---------- Du lieu ----------
 $script:Words = New-Object System.Collections.ArrayList
-if (Test-Path $DataFile) {
-    foreach ($w in (Get-Content $DataFile -Raw -Encoding UTF8 | ConvertFrom-Json)) {
+if ([IO.File]::Exists($DataFile) -or [IO.File]::Exists("$DataFile.bak")) {
+    try {
+        $savedWords = Read-JsonFile $DataFile 'danh sách từ'
+        foreach ($w in $savedWords.Data) {
         if (-not ($w.PSObject.Properties.Name -contains 'phonetic'))   { $w | Add-Member phonetic '' }     # du lieu ban cu
         if (-not ($w.PSObject.Properties.Name -contains 'definition')) { $w | Add-Member definition '' }
         [void]$script:Words.Add($w)
+        }
+        if ($savedWords.Recovered) {
+            [Windows.Forms.MessageBox]::Show("File danh sách từ chính bị lỗi. Đã khôi phục dữ liệu từ bản sao lưu:`r`n$($savedWords.Source)", 'Vocab Saver') | Out-Null
+        }
+    } catch {
+        [Windows.Forms.MessageBox]::Show("$($_.Exception.Message)`r`nApp sẽ đóng để tránh ghi đè dữ liệu. Hãy giữ lại các file words.json và words.json.bak để khôi phục.", 'Vocab Saver - Lỗi dữ liệu') | Out-Null
+        exit 1
     }
 }
 
 function Save-Words {
-    if (-not (Test-Path $Dir)) { New-Item -ItemType Directory $Dir | Out-Null }
     $json = ConvertTo-Json -InputObject @($script:Words.ToArray()) -Depth 3
-    [IO.File]::WriteAllText($DataFile, $json, (New-Object Text.UTF8Encoding $false))
+    Write-AtomicText $DataFile $json
 }
 
 function New-Client {
-    $wc = New-Object Net.WebClient
+    $wc = New-Object VocabSaverWebClient
     $wc.Encoding = [Text.Encoding]::UTF8
     if ($wc.Proxy) { $wc.Proxy.Credentials = [Net.CredentialCache]::DefaultNetworkCredentials }  # proxy cong ty
     $wc
@@ -307,10 +388,10 @@ foreach ($line in ($IrregularList -split "`n")) {
 function Get-BaseForm($w) {
     if ($script:Irregular.ContainsKey($w)) { return $script:Irregular[$w] }
     if ($w -notmatch '^[a-z]{4,}$' -or $w -notmatch '(ing|ed)$') { return $w }
-    if ((Test-Verb $w) -ne $false) { return $w }      # ban than la dong tu (need, bring...) hoac loi mang
     $s = if ($w.EndsWith('ing')) { $w.Substring(0, $w.Length - 3) } else { $w.Substring(0, $w.Length - 2) }
     $c = @()
     if ($w.EndsWith('ied')) { $c += $w.Substring(0, $w.Length - 3) + 'y' }
+    if ($w.EndsWith('ying')) { $c += $w.Substring(0, $w.Length - 4) + 'ie' }
     if ($s -match '[^aeiou][aeiou][^aeiouwxy]$') { $c += "${s}e", $s } else { $c += $s, "${s}e" }   # hop -> hope truoc
     if ($s -match '([^aeiou])\1$') { $c += $s.Substring(0, $s.Length - 1) }                          # runn -> run
     foreach ($x in ($c | Select-Object -Unique)) {
@@ -319,6 +400,7 @@ function Get-BaseForm($w) {
         if ($null -eq $r) { return $w }
         if ($r) { return $x }
     }
+    if ((Test-Verb $w) -eq $true) { return $w }
     $w
 }
 
@@ -349,36 +431,241 @@ function Invoke-Speak($text) {
 }
 
 function Add-Word($text) {
-    $orig = $text.ToLower()
-    $key = Get-BaseForm $orig
-    $from = if ($key -ne $orig) { " (từ $orig)" } else { '' }
+    $key = $text.ToLower()
+    if ($script:PendingWords.ContainsKey($key)) { return }
     $old = $script:Words | Where-Object { $_.word -eq $key } | Select-Object -First 1
     if ($old) { Show-Tip "Đã có: $key $($old.phonetic)" $old.meaning; return }
-    $meaning = ''
-    try { $meaning = Get-Translation $key }
-    catch { Add-Content $LogFile "[$(Get-Date -Format s)] Dịch '$key' lỗi: $($_.Exception.Message)" }
-    $ph = Get-Phonetic $key
-    $def = Get-Definition $key ($key -ne $orig)
-    [void]$script:Words.Add([pscustomobject]@{ word = $key; phonetic = $ph; meaning = $meaning; definition = $def; added = (Get-Date).ToString('s'); correct = 0; wrong = 0 })
-    Save-Words
-    if (-not $meaning) {
-        Show-Tip "✓ Đã lưu: $key$from" 'Dịch vụ dịch đang quá tải. App sẽ tự dịch lại sau vài phút.'
-        return
+    $entry = [pscustomobject]@{
+        word = $key; phonetic = ''; meaning = ''; definition = ''
+        added = (Get-Date).ToString('s'); correct = 0; wrong = 0
     }
-    $body = if ($def) { "$meaning`n$def" } else { $meaning }
-    Show-Tip "✓ Đã lưu: $key $ph$from" $body
+    [void]$script:Words.Add($entry)
+    Save-Words
+    $script:PendingWords[$key] = $true
+    try { Queue-LookupWorker $key 'Capture' @{ key = $key; entry = $entry } }
+    catch {
+        [void]$script:PendingWords.Remove($key)
+        Add-Content $LogFile "[$(Get-Date -Format s)] Tra cứu '$key' lỗi: $($_.Exception.Message)"
+        Show-Tip "✓ Đã lưu: $key" 'Chưa tra cứu được. App sẽ thử lại sau vài phút.'
+    }
 }
 
-# Bo sung phien am + dinh nghia cho tu luu tu ban cu (chi thu 1 lan moi phien chay)
-$script:PhTried = @{}
-function Update-Phonetic($w) {
-    if (($w.phonetic -and $w.definition) -or $script:PhTried.ContainsKey($w.word)) { return }
-    $script:PhTried[$w.word] = $true
-    $changed = $false
-    if (-not $w.phonetic)   { $ph = Get-Phonetic $w.word;   if ($ph) { $w.phonetic = $ph;   $changed = $true } }
-    if (-not $w.definition) { $df = Get-Definition $w.word; if ($df) { $w.definition = $df; $changed = $true } }
-    if ($changed) { Save-Words }
+$script:LookupWorkers = New-Object System.Collections.ArrayList
+$script:LookupQueue = New-Object System.Collections.Queue
+$script:MaxConcurrentLookups = 3
+$script:RefreshRunning = $false
+$script:PendingWords = @{}
+$script:LookupWorkerFunctionNames = @(
+    'New-Client', 'Get-HttpStatus', 'Get-GoogleTranslation', 'Get-MyMemoryTranslation',
+    'Get-Translation', 'Get-DictEntry', 'Test-Verb', 'Get-Phonetic', 'Get-Definition', 'Get-BaseForm'
+)
+$script:LookupWorkerFunctions = foreach ($name in $script:LookupWorkerFunctionNames) {
+    $function = Get-Command $name -CommandType Function
+    "function $name {`n$($function.Definition)`n}"
 }
+$script:LookupWorkerSource = @'
+param($payload, $mode, $irregular, $googleBlockedUntil)
+$script:Irregular = $irregular
+$script:GoogleBlockedUntil = $googleBlockedUntil
+$script:DictCache = @{}
+__FUNCTIONS__
+try {
+    if ($mode -eq 'Capture') {
+        $original = [string]$payload
+        $word = Get-BaseForm $original
+        $meaning = ''
+        $errorMessage = ''
+        try { $meaning = Get-Translation $word }
+        catch { $errorMessage = $_.Exception.Message }
+        $phonetic = Get-Phonetic $word
+        $definition = Get-Definition $word ($word -ne $original)
+        [pscustomobject]@{
+            word = $word; original = $original; meaning = $meaning
+            phonetic = $phonetic; definition = $definition; error = $errorMessage
+        }
+    } elseif ($mode -eq 'Refresh') {
+        foreach ($entry in $payload) {
+            $meaning = [string]$entry.meaning
+            if (-not $meaning) {
+                try { $meaning = Get-Translation $entry.word }
+                catch { break }
+            }
+            $phonetic = [string]$entry.phonetic
+            if (-not $phonetic) { $phonetic = Get-Phonetic $entry.word }
+            $definition = [string]$entry.definition
+            if (-not $definition) { $definition = Get-Definition $entry.word }
+            [pscustomobject]@{
+                word = $entry.word; meaning = $meaning
+                phonetic = $phonetic; definition = $definition
+            }
+        }
+    } elseif ($mode -eq 'Edit') {
+        $word = [string]$payload
+        [pscustomobject]@{
+            word = $word; meaning = (Get-Translation $word)
+            phonetic = (Get-Phonetic $word); definition = (Get-Definition $word)
+        }
+    }
+} catch {
+    [pscustomobject]@{ error = $_.Exception.Message }
+}
+[pscustomobject]@{ workerState = $true; googleBlockedUntil = $script:GoogleBlockedUntil }
+'@ -replace '__FUNCTIONS__', ($script:LookupWorkerFunctions -join "`n")
+
+function Start-LookupWorker($payload, $mode, $context) {
+    $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $worker = $null
+    try {
+        $runspace.ApartmentState = [Threading.ApartmentState]::MTA
+        $runspace.Open()
+        $worker = [System.Management.Automation.PowerShell]::Create()
+        $worker.Runspace = $runspace
+        [void]$worker.AddScript($script:LookupWorkerSource)
+        [void]$worker.AddArgument($payload)
+        [void]$worker.AddArgument($mode)
+        [void]$worker.AddArgument($script:Irregular.Clone())
+        [void]$worker.AddArgument($script:GoogleBlockedUntil)
+        $handle = $worker.BeginInvoke()
+        [void]$script:LookupWorkers.Add([pscustomobject]@{
+            PowerShell = $worker; Runspace = $runspace; Handle = $handle
+            Mode = $mode; Context = $context
+        })
+    } catch {
+        if ($worker) { $worker.Dispose() }
+        $runspace.Dispose()
+        throw
+    }
+}
+
+function Queue-LookupWorker($payload, $mode, $context) {
+    $script:LookupQueue.Enqueue([pscustomobject]@{ Payload = $payload; Mode = $mode; Context = $context })
+}
+
+function Complete-LookupWorker($job, $output, $failure) {
+    $state = $output | Where-Object { $_.workerState } | Select-Object -First 1
+    if ($state -and $state.googleBlockedUntil -gt $script:GoogleBlockedUntil) {
+        $script:GoogleBlockedUntil = $state.googleBlockedUntil
+    }
+    switch ($job.Mode) {
+        'Capture' {
+            [void]$script:PendingWords.Remove($job.Context.key)
+            if ($failure) {
+                Add-Content $LogFile "[$(Get-Date -Format s)] Tra cứu '$($job.Context.key)' lỗi: $failure"
+                Show-Tip "✓ Đã lưu: $($job.Context.key)" 'Chưa tra cứu được. App sẽ thử lại sau vài phút.'
+                return
+            }
+            $result = $output | Select-Object -First 1
+            if (-not $result -or -not $result.word) {
+                $message = if ($result.error) { $result.error } else { 'Không nhận được kết quả tra cứu.' }
+                Add-Content $LogFile "[$(Get-Date -Format s)] Tra cứu '$($job.Context.key)' lỗi: $message"
+                Show-Tip "✓ Đã lưu: $($job.Context.key)" 'Chưa tra cứu được. App sẽ thử lại sau vài phút.'
+                return
+            }
+            $entry = $job.Context.entry
+            $duplicate = $script:Words | Where-Object {
+                $_.word -eq $result.word -and -not [object]::ReferenceEquals($_, $entry)
+            } | Select-Object -First 1
+            if ($duplicate) {
+                [void]$script:Words.Remove($entry)
+                Save-Words
+                Show-Tip "Đã có: $($result.word) $($duplicate.phonetic)" $duplicate.meaning
+                return
+            }
+            $from = if ($result.word -ne $result.original) { " (từ $($result.original))" } else { '' }
+            $entry.word = $result.word
+            $entry.phonetic = $result.phonetic
+            $entry.meaning = $result.meaning
+            $entry.definition = $result.definition
+            Save-Words
+            if ($result.error) {
+                Add-Content $LogFile "[$(Get-Date -Format s)] Dịch '$($result.word)' lỗi: $($result.error)"
+            }
+            if (-not $result.meaning) {
+                Show-Tip "✓ Đã lưu: $($result.word)$from" 'Dịch vụ dịch đang quá tải. App sẽ tự dịch lại sau vài phút.'
+                return
+            }
+            $body = if ($result.definition) { "$($result.meaning)`n$($result.definition)" } else { $result.meaning }
+            Show-Tip "✓ Đã lưu: $($result.word) $($result.phonetic)$from" $body
+        }
+        'Refresh' {
+            $script:RefreshRunning = $false
+            $done = @()
+            $changed = $false
+            foreach ($result in $output) {
+                if ($result.workerState) { continue }
+                if ($result.error) {
+                    Add-Content $LogFile "[$(Get-Date -Format s)] Làm mới '$($result.word)' lỗi: $($result.error)"
+                    continue
+                }
+                $word = $script:Words | Where-Object { $_.word -eq $result.word } | Select-Object -First 1
+                if (-not $word) { continue }
+                $wasPending = -not $word.meaning
+                if ($result.meaning -and $word.meaning -ne $result.meaning) { $word.meaning = $result.meaning; $changed = $true }
+                if ($result.phonetic -and $word.phonetic -ne $result.phonetic) { $word.phonetic = $result.phonetic; $changed = $true }
+                if ($result.definition -and $word.definition -ne $result.definition) { $word.definition = $result.definition; $changed = $true }
+                if ($wasPending -and $word.meaning) { $done += "$($word.word): $($word.meaning)" }
+            }
+            if ($changed) { Save-Words }
+            if ($done) { Show-Tip "Đã dịch xong $($done.Count) từ" ($done -join "`n") }
+        }
+        'Edit' {
+            $context = $job.Context
+            $result = $output | Select-Object -First 1
+            if (-not $failure -and $result.error) { $failure = $result.error }
+            if ($failure) {
+                Add-Content $LogFile "[$(Get-Date -Format s)] Tra cứu '$($context.word)' lỗi: $failure"
+                if (-not $context.form.IsDisposed) {
+                    [Windows.Forms.MessageBox]::Show("Không tra cứu được: $failure", 'Sửa từ') | Out-Null
+                }
+            } elseif (-not $context.form.IsDisposed -and
+                (($context.controls.word.Text.Trim() -replace '\s+', ' ').ToLower() -eq $context.word)) {
+                $result = $output | Select-Object -First 1
+                $context.controls.mean.Text = $result.meaning
+                $context.controls.ph.Text = $result.phonetic
+                $context.controls.def.Text = $result.definition
+            }
+            if (-not $context.form.IsDisposed) {
+                $context.form.Cursor = 'Default'
+                $context.button.Enabled = $true
+            }
+        }
+    }
+}
+
+function Start-QueuedLookups {
+    while ($script:LookupWorkers.Count -lt $script:MaxConcurrentLookups -and $script:LookupQueue.Count -gt 0) {
+        $request = $script:LookupQueue.Dequeue()
+        try { Start-LookupWorker $request.Payload $request.Mode $request.Context }
+        catch {
+            $job = [pscustomobject]@{ Mode = $request.Mode; Context = $request.Context }
+            Complete-LookupWorker $job @() $_.Exception.Message
+        }
+    }
+}
+
+function Poll-LookupWorkers {
+    for ($i = $script:LookupWorkers.Count - 1; $i -ge 0; $i--) {
+        $job = $script:LookupWorkers[$i]
+        if (-not $job.Handle.IsCompleted) { continue }
+        $output = @()
+        $failure = ''
+        try {
+            $output = @($job.PowerShell.EndInvoke($job.Handle))
+            if ($job.PowerShell.Streams.Error.Count -gt 0) {
+                $failure = ($job.PowerShell.Streams.Error | ForEach-Object { $_.ToString() }) -join '; '
+            }
+        } catch { $failure = $_.Exception.Message }
+        finally {
+            $job.PowerShell.Dispose()
+            $job.Runspace.Dispose()
+            $script:LookupWorkers.RemoveAt($i)
+        }
+        Complete-LookupWorker $job $output $failure
+    }
+}
+
+# Moi tu chi thu bo sung phien am/dinh nghia mot lan moi phien chay.
+$script:PhTried = @{}
 
 # ---------- Giao dien ----------
 function Hex($h) { [Drawing.ColorTranslator]::FromHtml($h) }
@@ -464,6 +751,7 @@ $onDrag = {
 
 # ---------- Bai tap ----------
 $script:QuizOpen = $false
+$script:QuizCloseTimer = $null
 
 $onAnswer = {
     param($s, $e)
@@ -493,18 +781,27 @@ $onAnswer = {
         $q.def.Visible = $true
         $form.Height += $q.def.PreferredHeight + 12
     }
-    $t = New-Object Windows.Forms.Timer
-    $t.Interval = if ($hasDef) { if ($ok) { 4000 } else { 6000 } } elseif ($ok) { 1200 } else { 2500 }
-    $t.Tag = $form
-    $t.Add_Tick({ param($t2, $e2) $t2.Stop(); if (-not $t2.Tag.IsDisposed) { $t2.Tag.Close() } })
-    $t.Start()
+    if ($script:QuizCloseTimer) {
+        $script:QuizCloseTimer.Stop()
+        $script:QuizCloseTimer.Dispose()
+    }
+    $script:QuizCloseTimer = New-Object Windows.Forms.Timer
+    $script:QuizCloseTimer.Interval = if ($hasDef) { if ($ok) { 4000 } else { 6000 } } elseif ($ok) { 1200 } else { 2500 }
+    $script:QuizCloseTimer.Tag = $form
+    $script:QuizCloseTimer.Add_Tick({
+        param($timer, $eventArgs)
+        $timer.Stop()
+        if (-not $timer.Tag.IsDisposed) { $timer.Tag.Close() }
+    })
+    $script:QuizCloseTimer.Start()
 }
 
 function Show-Quiz([switch]$Manual) {
     if ($script:QuizOpen) { return }
     $ready = @($script:Words | Where-Object { $_.meaning })      # bo qua tu dang cho dich
-    if ($ready.Count -lt 4) {
-        if ($Manual) { Show-Tip 'Chưa đủ từ' 'Cần ít nhất 4 từ đã có nghĩa để làm bài.' }
+    $meanings = @($ready | ForEach-Object { $_.meaning } | Where-Object { $_ } | Select-Object -Unique)
+    if ($meanings.Count -lt 4) {
+        if ($Manual) { Show-Tip 'Chưa đủ đáp án' "Cần ít nhất 4 nghĩa khác nhau để làm bài. Hiện có $($meanings.Count)." }
         return
     }
     # Uu tien tu hay sai: lay 1/3 tu diem thap nhat roi chon ngau nhien
@@ -512,15 +809,11 @@ function Show-Quiz([switch]$Manual) {
     $n = [Math]::Max(3, [Math]::Ceiling($sorted.Count / 3))
     $item = $sorted[0..($n - 1)] | Get-Random
     $answer = $item.meaning
-    $distractors = @($ready | ForEach-Object { $_.meaning } | Where-Object { $_ -ne $answer } |
-                     Select-Object -Unique | Get-Random -Count 3)
-    if ($distractors.Count -lt 3) { return }
+    $distractors = @($meanings | Where-Object { $_ -ne $answer } | Get-Random -Count 3)
     $options = (@($answer) + $distractors) | Get-Random -Count 4
 
     $script:QuizOpen = $true
     $script:Theme = Get-Theme
-    Update-Phonetic $item
-
     # Khung: form khong vien, nen 1px lam duong vien, panel ben trong
     $f = New-Object Windows.Forms.Form
     $f.Text = 'Vocab Saver - Bài tập'
@@ -607,6 +900,13 @@ function Show-Quiz([switch]$Manual) {
     $f.ClientSize = New-Object Drawing.Size(460, ($y + 52))
     $f.CancelButton = $skip      # Esc = bo qua
     $f.Tag = @{ answer = $answer; item = $item; done = $false; buttons = $btns; feedback = $fb; def = $def }
+    $f.Add_FormClosed({
+        if ($script:QuizCloseTimer) {
+            $script:QuizCloseTimer.Stop()
+            $script:QuizCloseTimer.Dispose()
+            $script:QuizCloseTimer = $null
+        }
+    })
     $f.Add_Shown({
         param($s, $e)
         if ($script:HasNative) { $v = 2; [void][VsNative]::DwmSetWindowAttribute($s.Handle, 33, [ref]$v, 4) }  # bo goc Win11
@@ -655,12 +955,15 @@ function Show-EditDialog($w, $owner) {
         $d = $s.FindForm().Tag
         $txt = ($d.word.Text.Trim() -replace '\s+', ' ').ToLower()
         if (-not $txt) { return }
-        $s.FindForm().Cursor = 'WaitCursor'
-        try { $d.mean.Text = Get-Translation $txt }
-        catch { [Windows.Forms.MessageBox]::Show("Không dịch được: $($_.Exception.Message)", 'Sửa từ') | Out-Null }
-        $d.ph.Text = Get-Phonetic $txt
-        $d.def.Text = Get-Definition $txt
-        $s.FindForm().Cursor = 'Default'
+        $form = $s.FindForm()
+        $form.Cursor = 'WaitCursor'
+        $s.Enabled = $false
+        try { Queue-LookupWorker $txt 'Edit' @{ form = $form; controls = $d; button = $s; word = $txt } }
+        catch {
+            $form.Cursor = 'Default'
+            $s.Enabled = $true
+            [Windows.Forms.MessageBox]::Show("Không thể bắt đầu tra cứu: $($_.Exception.Message)", 'Sửa từ') | Out-Null
+        }
     })
     $ok.Add_Click({
         param($s, $e)
@@ -668,6 +971,10 @@ function Show-EditDialog($w, $owner) {
         $nw = ($d.word.Text.Trim() -replace '\s+', ' ').ToLower()
         $nm = $d.mean.Text.Trim()
         if (-not $nw -or -not $nm) { [Windows.Forms.MessageBox]::Show('Từ và nghĩa không được để trống.', 'Sửa từ') | Out-Null; return }
+        if ($nw -notmatch $script:WordRe) {
+            [Windows.Forms.MessageBox]::Show('Từ phải gồm 1–4 từ tiếng Anh, chỉ chứa chữ cái và dấu nháy.', 'Sửa từ') | Out-Null
+            return
+        }
         if ($nw -ne $d.orig -and ($script:Words | Where-Object { $_.word -eq $nw })) {
             [Windows.Forms.MessageBox]::Show("Từ '$nw' đã có trong danh sách.", 'Sửa từ') | Out-Null; return
         }
@@ -904,25 +1211,41 @@ $clipTimer.Add_Tick({
     if ($t -ceq $script:LastClip) { return }
     $script:LastClip = $t
     $t = ($t.Trim() -replace '\s+', ' ')
-    if ($t -cmatch $WordRe) { Add-Word $t }
+    if ($t -cmatch $script:WordRe) { Add-Word $t }
 })
 $clipTimer.Start()
 
 $retryTimer = New-Object Windows.Forms.Timer
 $retryTimer.Interval = 3 * 60 * 1000
 $retryTimer.Add_Tick({
-    $pending = @($script:Words | Where-Object { -not $_.meaning } | Select-Object -First 5)
+    if ($script:RefreshRunning) { return }
+    $pending = @($script:Words | Where-Object {
+        (-not $_.meaning) -or
+        ((-not $_.phonetic -or -not $_.definition) -and -not $script:PhTried.ContainsKey($_.word))
+    } | Select-Object -First 5)
     if (-not $pending) { return }
-    $done = @()
     foreach ($w in $pending) {
-        try { $w.meaning = Get-Translation $w.word } catch { break }      # van loi thi doi lan sau
-        if (-not $w.phonetic)   { $w.phonetic = Get-Phonetic $w.word }
-        if (-not $w.definition) { $w.definition = Get-Definition $w.word }
-        $done += "$($w.word): $($w.meaning)"
+        if (-not $w.meaning) { continue }
+        $script:PhTried[$w.word] = $true
     }
-    if ($done) { Save-Words; Show-Tip "Đã dịch xong $($done.Count) từ" ($done -join "`n") }
+    try {
+        Queue-LookupWorker $pending 'Refresh' @{}
+        $script:RefreshRunning = $true
+    }
+    catch {
+        foreach ($w in $pending) {
+            if (-not $w.meaning) { continue }
+            $script:PhTried.Remove($w.word)
+        }
+        Add-Content $LogFile "[$(Get-Date -Format s)] Không thể bắt đầu dịch lại: $($_.Exception.Message)"
+    }
 })
 $retryTimer.Start()
+
+$lookupTimer = New-Object Windows.Forms.Timer
+$lookupTimer.Interval = 250
+$lookupTimer.Add_Tick({ Poll-LookupWorkers; Start-QueuedLookups })
+$lookupTimer.Start()
 
 $script:QuizTimer = New-Object Windows.Forms.Timer
 $script:QuizTimer.Interval = $script:QuizMinutes * 60 * 1000
@@ -939,7 +1262,12 @@ Show-Tip 'Vocab Saver đang chạy' 'Bôi đen từ tiếng Anh rồi Ctrl+C đ�
 [Windows.Forms.MessageBox]::Show("Vocab Saver đã chạy.`r`n`r`nBôi đen từ tiếng Anh rồi Ctrl+C để lưu.`r`nChuột phải icon (i) ở khay hệ thống để mở menu.", 'Vocab Saver') | Out-Null
 [Windows.Forms.Application]::Run()
 
-$clipTimer.Stop(); $retryTimer.Stop(); $script:QuizTimer.Stop()
+$clipTimer.Stop(); $retryTimer.Stop(); $lookupTimer.Stop(); $script:QuizTimer.Stop()
+foreach ($job in $script:LookupWorkers) {
+    if (-not $job.Handle.IsCompleted) { $job.PowerShell.Stop() }
+    $job.PowerShell.Dispose()
+    $job.Runspace.Dispose()
+}
 if ($script:Synth) { $script:Synth.Dispose() }
 $script:Tray.Visible = $false
 $script:Tray.Dispose()
