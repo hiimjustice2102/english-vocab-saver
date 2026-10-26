@@ -187,8 +187,11 @@ function Get-Translation($text) {
     if ([DateTime]::Now -ge $script:GoogleBlockedUntil) {
         try { return Get-GoogleTranslation $text }
         catch {
-            if ((Get-HttpStatus $_) -eq 429) { $script:GoogleBlockedUntil = [DateTime]::Now.AddMinutes(15) }
-            $errs += "Google: HTTP $(Get-HttpStatus $_)"
+            $status = Get-HttpStatus $_
+            if ($status -eq 429) { $script:GoogleBlockedUntil = [DateTime]::Now.AddMinutes(15) }
+            $detail = $_.Exception.Message
+            if ($status) { $errs += "Google: HTTP ${status} - $detail" }
+            else { $errs += "Google: $detail" }
         }
     } else { $errs += 'Google: đang tạm nghỉ do bị giới hạn (429)' }
     try { return Get-MyMemoryTranslation $text }
@@ -409,6 +412,16 @@ function Show-Tip($title, $text) {
     $script:Tray.ShowBalloonTip(3000, $title, $text, [Windows.Forms.ToolTipIcon]::Info)
 }
 
+function Format-LookupError($message) {
+    $message = ([string]$message -replace '\s+', ' ').Trim()
+    if (-not $message) { $message = 'Chưa nhận được kết quả từ dịch vụ tra cứu.' }
+    $prefix = 'Lỗi tra cứu: '
+    $suffix = ' (sẽ thử lại sau vài phút)'
+    $maxLength = 180 - $prefix.Length - $suffix.Length
+    if ($message.Length -gt $maxLength) { $message = $message.Substring(0, $maxLength - 3) + '...' }
+    "$prefix$message$suffix"
+}
+
 # ---------- Doc phat am (giong doc co san cua Windows, khong can mang) ----------
 $script:Synth = $null
 try {
@@ -566,14 +579,14 @@ function Complete-LookupWorker($job, $output, $failure) {
             [void]$script:PendingWords.Remove($job.Context.key)
             if ($failure) {
                 Add-Content $LogFile "[$(Get-Date -Format s)] Tra cứu '$($job.Context.key)' lỗi: $failure"
-                Show-Tip "✓ Đã lưu: $($job.Context.key)" 'Chưa tra cứu được. App sẽ thử lại sau vài phút.'
+                Show-Tip "✓ Đã lưu: $($job.Context.key)" (Format-LookupError $failure)
                 return
             }
             $result = $output | Select-Object -First 1
             if (-not $result -or -not $result.word) {
                 $message = if ($result.error) { $result.error } else { 'Không nhận được kết quả tra cứu.' }
                 Add-Content $LogFile "[$(Get-Date -Format s)] Tra cứu '$($job.Context.key)' lỗi: $message"
-                Show-Tip "✓ Đã lưu: $($job.Context.key)" 'Chưa tra cứu được. App sẽ thử lại sau vài phút.'
+                Show-Tip "✓ Đã lưu: $($job.Context.key)" (Format-LookupError $message)
                 return
             }
             $entry = $job.Context.entry
@@ -596,7 +609,7 @@ function Complete-LookupWorker($job, $output, $failure) {
                 Add-Content $LogFile "[$(Get-Date -Format s)] Dịch '$($result.word)' lỗi: $($result.error)"
             }
             if (-not $result.meaning) {
-                Show-Tip "✓ Đã lưu: $($result.word)$from" 'Dịch vụ dịch đang quá tải. App sẽ tự dịch lại sau vài phút.'
+                Show-Tip "✓ Đã lưu: $($result.word)$from" (Format-LookupError $result.error)
                 return
             }
             $body = if ($result.definition) { "$($result.meaning)`n$($result.definition)" } else { $result.meaning }

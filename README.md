@@ -22,6 +22,8 @@ If the app does not start or you need to see error details, double-click `VocabS
 .\VocabSaver-Debug.bat
 ```
 
+Lookup failures are shown in the system-tray notification. For full details, check `%TEMP%\VocabSaver_error.log`.
+
 ## How to use
 
 1. While reading a web page, select an English word or phrase (up to 4 words) and press **Ctrl+C**.
