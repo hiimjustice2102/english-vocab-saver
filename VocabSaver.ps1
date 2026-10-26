@@ -538,7 +538,8 @@ try {
     [pscustomobject]@{ error = $_.Exception.Message }
 }
 [pscustomobject]@{ workerState = $true; googleBlockedUntil = $script:GoogleBlockedUntil }
-'@ -replace '__FUNCTIONS__', ($script:LookupWorkerFunctions -join "`n")
+'@
+$script:LookupWorkerSource = $script:LookupWorkerSource.Replace('__FUNCTIONS__', ($script:LookupWorkerFunctions -join "`n"))
 
 function Start-LookupWorker($payload, $mode, $context) {
     $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
