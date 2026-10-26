@@ -465,6 +465,21 @@ $script:LookupWorkerFunctions = foreach ($name in $script:LookupWorkerFunctionNa
 }
 $script:LookupWorkerSource = @'
 param($payload, $mode, $irregular, $googleBlockedUntil)
+if (-not ('VocabSaverWebClient' -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Net;
+public sealed class VocabSaverWebClient : WebClient {
+    protected override WebRequest GetWebRequest(Uri address) {
+        var request = base.GetWebRequest(address);
+        request.Timeout = 10000;
+        var httpRequest = request as HttpWebRequest;
+        if (httpRequest != null) httpRequest.ReadWriteTimeout = 10000;
+        return request;
+    }
+}
+"@
+}
 $script:Irregular = $irregular
 $script:GoogleBlockedUntil = $googleBlockedUntil
 $script:DictCache = @{}
